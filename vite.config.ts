@@ -18,7 +18,10 @@ export default defineConfig(({ mode }) => {
     plugins: [
       react(),
       VitePWA({
-      workbox: { maximumFileSizeToCacheInBytes: 10 * 1024 * 1024 },
+      workbox: {
+        maximumFileSizeToCacheInBytes: 10 * 1024 * 1024,
+        globIgnores: ['**/brand/crest.png']
+      },
         registerType: "autoUpdate",
         injectRegister: false,
         includeAssets: ["favicon.ico", "apple-touch-icon.png"],

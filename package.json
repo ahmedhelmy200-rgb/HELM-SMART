@@ -12,8 +12,6 @@
     "electron:build": "vite build && electron-builder"
   },
   "dependencies": {
-    "@capacitor/cli": "^7.5.0",
-    "@capacitor/core": "^8.1.0",
     "react": "^18.2.0",
     "react-dom": "^18.2.0",
     "recharts": "^3.6.0",

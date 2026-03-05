@@ -55,6 +55,10 @@ export default defineConfig(({ mode }) => {
           // patterns won't match anything under `dev-dist`. Keep dev clean and rely on
           // runtimeCaching. In production build, precache the real output.
           globPatterns: isDev ? [] : ["**/*.{js,css,html,ico,png,svg,woff2}", "assets/**/*"],
+
+          // ✅ استثناء الملف الكبير حتى لا يفشل build
+          globIgnores: ["**/brand/crest.png"],
+
           runtimeCaching: [
             {
               // Avoid caching API calls (Supabase, etc.)

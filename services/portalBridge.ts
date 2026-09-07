@@ -1,3 +1,5 @@
+import { getCloudConfig, kvSetMany } from './cloudSync';
+
 type PortalSmartPayload = {
   config?: any;
   clients?: any[];
@@ -8,6 +10,9 @@ type PortalSmartPayload = {
   logs?: any[];
   reminders?: any[];
   notes?: any[];
+  portalMirror?: any;
+  syncMeta?: any;
+  syncVersion?: string;
   source?: string;
   syncedAt?: string;
 };
@@ -16,6 +21,9 @@ const INBOUND_MESSAGE_TYPE = 'HELM_PORTAL_SYNC_DATA';
 const OUTBOUND_MESSAGE_TYPE = 'HELM_SMART_DATA_CHANGED';
 const ACK_TYPE = 'HELM_SMART_SYNC_ACK';
 const LAST_SYNC_KEY = 'helm_portal_last_sync';
+const SYNC_META_KEY = 'helm_portal_sync_meta';
+const FULL_SNAPSHOT_KEY = 'helm_portal_full_snapshot';
+const CLOUD_PERSISTED_AT_KEY = 'helm_portal_cloud_persisted_at';
 const SUPPRESS_OUTBOUND_UNTIL = 'helm_portal_bridge_suppress_outbound_until';
 
 const STORAGE_MAP: Record<string, keyof PortalSmartPayload> = {
@@ -28,9 +36,13 @@ const STORAGE_MAP: Record<string, keyof PortalSmartPayload> = {
   legalmaster_logs: 'logs',
   legalmaster_reminders: 'reminders',
   legalmaster_notes: 'notes',
+  [FULL_SNAPSHOT_KEY]: 'portalMirror',
 };
 
-const WATCHED_KEYS = new Set(Object.keys(STORAGE_MAP));
+// The full raw Portal mirror is backup/reference data. Do not send it back on
+// every localStorage change because it can be large; Smart's mapped datasets
+// remain the outbound editable surface.
+const WATCHED_KEYS = new Set(Object.keys(STORAGE_MAP).filter((key) => key !== FULL_SNAPSHOT_KEY));
 let outboundTimer: number | null = null;
 let patched = false;
 
@@ -75,6 +87,7 @@ function readCurrentPayload(changedKey?: string): PortalSmartPayload & { changed
   };
 
   Object.entries(STORAGE_MAP).forEach(([storageKey, payloadKey]) => {
+    if (payloadKey === 'portalMirror') return;
     const fallback = payloadKey === 'config' ? null : [];
     (payload as any)[payloadKey] = safeJsonRead(storageKey, fallback as any);
   });
@@ -83,20 +96,63 @@ function readCurrentPayload(changedKey?: string): PortalSmartPayload & { changed
   return payload;
 }
 
-function applyPortalPayload(payload: PortalSmartPayload) {
+async function persistPortalPayloadToCloud(payload: PortalSmartPayload) {
+  const cfg = getCloudConfig();
+  if (!cfg) return { mode: 'local' as const, cloudSaved: false, warning: 'cloud-not-configured' };
+
+  const rows = Object.entries(STORAGE_MAP)
+    .filter(([, payloadKey]) => payload[payloadKey] !== undefined && payload[payloadKey] !== null)
+    .map(([storageKey, payloadKey]) => ({ key: storageKey, value: payload[payloadKey] }));
+
+  rows.push({
+    key: LAST_SYNC_KEY,
+    value: {
+      syncedAt: payload.syncedAt || new Date().toISOString(),
+      source: payload.source || 'helm-portal',
+      syncVersion: payload.syncVersion || 'legacy',
+    },
+  });
+
+  rows.push({
+    key: SYNC_META_KEY,
+    value: payload.syncMeta || null,
+  });
+
+  try {
+    await kvSetMany(rows as any, cfg as any);
+    const at = new Date().toISOString();
+    localStorage.setItem(CLOUD_PERSISTED_AT_KEY, at);
+    return { mode: 'cloud' as const, cloudSaved: true, at };
+  } catch (error: any) {
+    console.warn('[HELM Smart] Portal mirror saved locally but cloud persistence failed:', error?.message || error);
+    return {
+      mode: 'local' as const,
+      cloudSaved: false,
+      warning: error?.message || 'cloud-persist-failed',
+    };
+  }
+}
+
+async function applyPortalPayload(payload: PortalSmartPayload) {
   suppressOutbound(8000);
   Object.entries(STORAGE_MAP).forEach(([storageKey, payloadKey]) => {
     safeJsonWrite(storageKey, payload[payloadKey]);
   });
 
-  localStorage.setItem(LAST_SYNC_KEY, payload.syncedAt || new Date().toISOString());
+  const syncedAt = payload.syncedAt || new Date().toISOString();
+  localStorage.setItem(LAST_SYNC_KEY, syncedAt);
+  safeJsonWrite(SYNC_META_KEY, payload.syncMeta || null);
   localStorage.setItem('helm_portal_bridge_enabled', '1');
   localStorage.setItem('helm_portal_bridge_source', payload.source || 'helm-portal');
+  localStorage.setItem('helm_portal_bridge_version', payload.syncVersion || 'legacy');
+
+  const cloud = await persistPortalPayloadToCloud(payload);
+  return { syncedAt, cloud };
 }
 
-function postAck(status: 'ok' | 'error', message?: string) {
+function postAck(status: 'ok' | 'error', message?: string, details?: Record<string, any>) {
   try {
-    window.parent?.postMessage({ type: ACK_TYPE, status, message, at: new Date().toISOString() }, '*');
+    window.parent?.postMessage({ type: ACK_TYPE, status, message, at: new Date().toISOString(), ...(details || {}) }, '*');
   } catch {
     // ignore
   }
@@ -150,15 +206,25 @@ export function installPortalBridge() {
 
   patchLocalStorageOutbound();
 
-  window.addEventListener('message', (event) => {
+  window.addEventListener('message', async (event) => {
     const data = event?.data;
     if (!data || data.type !== INBOUND_MESSAGE_TYPE) return;
 
     try {
       const payload = data.payload as PortalSmartPayload;
       if (!payload || typeof payload !== 'object') throw new Error('Invalid portal payload');
-      applyPortalPayload(payload);
-      postAck('ok');
+      const result = await applyPortalPayload(payload);
+      const message = result.cloud.cloudSaved
+        ? 'portal-sync-stored-cloud'
+        : result.cloud.warning === 'cloud-not-configured'
+          ? 'portal-sync-stored-local'
+          : 'portal-sync-stored-local-cloud-warning';
+      postAck('ok', message, {
+        storage: result.cloud.cloudSaved ? 'cloud+local' : 'local',
+        cloudWarning: result.cloud.warning || null,
+        syncVersion: payload.syncVersion || 'legacy',
+        syncMeta: payload.syncMeta || null,
+      });
 
       // Reload once so App.tsx rehydrates its localStorage-backed state.
       if (!sessionStorage.getItem('helm_portal_bridge_reloaded')) {

@@ -1,4 +1,4 @@
-import { getCloudConfig, kvSetMany } from './cloudSync';
+import { getCloudAuth, getCloudConfig, kvSetMany } from './cloudSync';
 
 type PortalSmartPayload = {
   config?: any;
@@ -113,6 +113,19 @@ function readCurrentPayload(changedKey?: string): PortalSmartPayload & { changed
   return payload;
 }
 
+function isAnonymousAccessToken(token: string) {
+  try {
+    const raw = token.split('.')[1];
+    if (!raw) return false;
+    const normalized = raw.replace(/-/g, '+').replace(/_/g, '/');
+    const padded = normalized.padEnd(Math.ceil(normalized.length / 4) * 4, '=');
+    const claims = JSON.parse(atob(padded));
+    return claims?.is_anonymous === true;
+  } catch {
+    return false;
+  }
+}
+
 function openMirrorDb(): Promise<IDBDatabase | null> {
   if (typeof indexedDB === 'undefined') return Promise.resolve(null);
   return new Promise((resolve) => {
@@ -187,6 +200,10 @@ function buildCloudMirrorRows(mirror: any, syncedAt: string) {
 async function persistPortalPayloadToCloud(payload: PortalSmartPayload) {
   const cfg = getCloudConfig();
   if (!cfg) return { mode: 'local' as const, cloudSaved: false, warning: 'cloud-not-configured' };
+
+  const auth = getCloudAuth();
+  if (!auth?.accessToken) return { mode: 'local' as const, cloudSaved: false, warning: 'cloud-auth-required' };
+  if (isAnonymousAccessToken(auth.accessToken)) return { mode: 'local' as const, cloudSaved: false, warning: 'cloud-anonymous-auth-blocked' };
 
   const coreRows = Object.entries(STORAGE_MAP)
     .filter(([, payloadKey]) => payload[payloadKey] !== undefined && payload[payloadKey] !== null)
@@ -319,7 +336,11 @@ export function installPortalBridge() {
         ? 'portal-sync-stored-cloud'
         : result.cloud.warning === 'cloud-not-configured'
           ? 'portal-sync-stored-local'
-          : 'portal-sync-stored-local-cloud-warning';
+          : result.cloud.warning === 'cloud-auth-required'
+            ? 'portal-sync-stored-local-auth-required'
+            : result.cloud.warning === 'cloud-anonymous-auth-blocked'
+              ? 'portal-sync-stored-local-anonymous-blocked'
+              : 'portal-sync-stored-local-cloud-warning';
 
       postAck('ok', message, {
         storage: result.cloud.cloudSaved ? 'cloud+local' : 'local',
